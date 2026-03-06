@@ -3,10 +3,11 @@
 namespace FlexiLaravel\Console\Commands;
 
 use FlexiCore\Core\Constants;
+use FlexiCore\Core\RegistryComponentReference;
 use FlexiCore\Core\RegistryStore;
+use FlexiCore\Core\RegistryVersionResolver;
 use FlexiCore\Installer\PackageInstaller;
 use FlexiCore\Service\ProjectDetector;
-use FlexiCore\Utils\HttpUtils;
 use Illuminate\Console\Command;
 use Symfony\Component\Yaml\Yaml;
 
@@ -16,9 +17,12 @@ use function Laravel\Prompts\spin;
 class FlexiAddCommand extends Command
 {
     protected $signature = 'flexi:add
-        {components* : Component names to add}
+        {components* : Component refs to add (button, button@0.0.2, @fly-ui/button@0.0.1)}
         {--namespace= : Namespace to use for all components}
-        {--skip-deps : Skip dependency installation}';
+        {--skip-deps : Skip dependency installation}
+        {--rewrite : Rewrite existing files for already installed components}
+        {--no-rewrite : Do not rewrite existing files for already installed components}
+        {--dry : Show planned changes only; do not write files or install dependencies}';
 
     protected $description = 'Add UI components to your project from component registries';
 
@@ -28,11 +32,18 @@ class FlexiAddCommand extends Command
     private array $installedRegistryComponents = [];
     private array $pendingCommands = [];
     private array $createdFiles = [];
+    private array $overwrittenFiles = [];
+    private array $skippedFiles = [];
+    private array $resolvedRegistries = [];
     private array $postInstallMessages = [];
     private bool $skipPackageInstallation = false;
+    private bool $dryRun = false;
+    private bool $forceRewrite = false;
+    private bool $forceNoRewrite = false;
 
     public function __construct(
-        private readonly RegistryStore $store = new RegistryStore()
+        private readonly RegistryStore $store = new RegistryStore(),
+        private readonly RegistryVersionResolver $versionResolver = new RegistryVersionResolver()
     ) {
         parent::__construct();
         $this->projectRoot = getcwd();
@@ -44,6 +55,14 @@ class FlexiAddCommand extends Command
         $components = (array) $this->argument('components');
         $namespace = $this->option('namespace');
         $skipDeps = (bool) $this->option('skip-deps');
+        $this->dryRun = (bool) $this->option('dry');
+        $this->forceRewrite = (bool) $this->option('rewrite');
+        $this->forceNoRewrite = (bool) $this->option('no-rewrite');
+
+        if ($this->forceRewrite && $this->forceNoRewrite) {
+            $this->error('Cannot use --rewrite and --no-rewrite together.');
+            return self::FAILURE;
+        }
 
         if (!$this->configExists()) {
             $this->error('Flexiwind not initialized. Run flexi:init first.');
@@ -56,10 +75,18 @@ class FlexiAddCommand extends Command
             $this->addComponent($component, is_string($namespace) ? $namespace : null, $skipDeps);
         }
 
-        if (!empty($this->createdFiles)) {
+        if ($this->dryRun) {
+            $this->renderDryRunSummary();
+            return self::SUCCESS;
+        }
+
+        if (!empty($this->createdFiles) || !empty($this->overwrittenFiles)) {
             $this->info('====== Everything installed ======');
             foreach ($this->createdFiles as $fileCreated) {
                 $this->line("✓ Created : {$fileCreated}");
+            }
+            foreach ($this->overwrittenFiles as $fileOverwritten) {
+                $this->line("↺ Overwritten : {$fileOverwritten}");
             }
 
             $this->renderPostInstallMessages();
@@ -88,21 +115,52 @@ class FlexiAddCommand extends Command
         $this->registries = $config['registries'] ?? [];
     }
 
-    private function addComponent(string $component, ?string $namespace, bool $skipDeps = false): void
+    private function addComponent(string $componentInput, ?string $namespace, bool $skipDeps = false): void
     {
-        $source = $this->determineSource($component, $namespace);
-        $registryJson = $this->fetchRegistry($component, $source);
-
-        if (!$registryJson) {
-            $this->warn("Registry not found for component: {$component}");
+        try {
+            $reference = RegistryComponentReference::parse($componentInput);
+        } catch (\InvalidArgumentException $e) {
+            $this->warn($e->getMessage());
             return;
         }
+
+        $source = $this->determineSource($reference, $namespace);
+        $resolved = $this->fetchRegistry($reference, $source);
+
+        if (!$resolved) {
+            $this->warn("Registry not found for component: {$reference->toDisplay()}");
+            return;
+        }
+
+        $registryJson = $resolved['registry'];
+        $resolvedVersion = $resolved['resolvedVersion'] ?? ($registryJson['version'] ?? Constants::DEFAULT_COMPONENT_VERSION);
+        $this->resolvedRegistries[] = [
+            'component' => $reference->component,
+            'requested' => $reference->version,
+            'resolved' => $resolvedVersion,
+            'url' => $resolved['url'] ?? '',
+        ];
+
         if (!isset($registryJson['files']) || !is_array($registryJson['files'])) {
-            $this->warn("Invalid registry: no files for {$component}");
+            $this->warn("Invalid registry: no files for {$reference->component}");
             return;
         }
 
-        $this->line("Adding component: {$component}");
+        $storeNamespace = $reference->namespace ?? $namespace ?? 'flexiwind';
+        $isInstalled = $this->store->exists($reference->component, $storeNamespace);
+        $installedVersion = $this->store->getVersion($reference->component, $storeNamespace);
+        $rewrite = $this->resolveRewriteDecision(
+            $reference,
+            $isInstalled,
+            $installedVersion,
+            is_string($resolvedVersion) ? $resolvedVersion : null
+        );
+        if ($isInstalled && !$rewrite) {
+            $this->line("Skipping {$reference->component}. Use --rewrite, {$reference->component}@<version>, or upgrade {$reference->component}.");
+            return;
+        }
+
+        $this->line("Adding component: {$reference->toDisplay()}");
 
         if (isset($registryJson['registryDependencies']) && is_array($registryJson['registryDependencies'])) {
             $this->handleRegistryDependencies($registryJson['registryDependencies'], $namespace);
@@ -111,41 +169,63 @@ class FlexiAddCommand extends Command
             $this->handlePackageDependencies($registryJson);
         }
 
-        spin(message: 'Processing files...', callback: function () use ($registryJson): void {
+        if ($this->dryRun) {
             foreach ($registryJson['files'] as $file) {
-                $this->processFile($file);
+                $this->processFile($file, $rewrite);
             }
-        });
+        } else {
+            spin(message: 'Processing files...', callback: function () use ($registryJson, $rewrite): void {
+                foreach ($registryJson['files'] as $file) {
+                    $this->processFile($file, $rewrite);
+                }
+            });
+        }
 
-        $this->installedRegistryComponents[] = $component;
+        $this->installedRegistryComponents[] = $reference->component;
 
         if (isset($registryJson['message'])) {
             $this->collectPostInstallMessage($registryJson['message']);
         }
 
-        $nameSpace = str_starts_with($component, '@')
-            ? explode('/', $component)[0]
-            : ($namespace ? $namespace : 'flexiwind');
-        $this->store->add($component, $nameSpace, $registryJson['version'], $registryJson['message'] ?? null);
-        $this->info("{$component} added successfully");
+        if (!$this->dryRun) {
+            $this->store->add(
+                $reference->component,
+                $storeNamespace,
+                is_string($resolvedVersion) ? $resolvedVersion : Constants::DEFAULT_COMPONENT_VERSION,
+                $registryJson['message'] ?? null
+            );
+            $this->info("{$reference->component} added successfully");
+            return;
+        }
+
+        $this->line("[dry] Planned install for {$reference->toDisplay()}");
     }
 
     private function handleRegistryDependencies(array $registryDependencies, ?string $namespace): void
     {
         foreach ($registryDependencies as $dependency) {
-            if (in_array($dependency, $this->installedRegistryComponents, true)) {
-                continue;
-            }
-            if ($this->isRegistryComponentInstalled($dependency)) {
-                $this->line("Registry dependency already installed: {$dependency}");
+            try {
+                $dependencyRef = RegistryComponentReference::parse((string) $dependency);
+            } catch (\InvalidArgumentException) {
+                $this->warn("Invalid registry dependency reference: {$dependency}");
                 continue;
             }
 
-            $this->line("Installing registry dependency: {$dependency}");
+            if (in_array($dependencyRef->component, $this->installedRegistryComponents, true)) {
+                continue;
+            }
+
+            $depNamespace = $dependencyRef->namespace ?? $namespace ?? 'flexiwind';
+            if ($this->isRegistryComponentInstalled($dependencyRef, $depNamespace) && $dependencyRef->version === null) {
+                $this->line("Registry dependency already installed: {$dependencyRef->component}");
+                continue;
+            }
+
+            $this->line("Installing registry dependency: {$dependencyRef->toDisplay()}");
             if ($this->skipPackageInstallation) {
                 $this->showPendingCommands();
             }
-            $this->addComponent($dependency, $namespace, false);
+            $this->addComponent($dependencyRef->toDisplay(), $namespace, false);
         }
     }
 
@@ -171,6 +251,11 @@ class FlexiAddCommand extends Command
             foreach ($nodeDeps as $dep) {
                 $this->line("  - {$dep}");
             }
+        }
+
+        if ($this->dryRun) {
+            $this->savePendingCommands($dependencies, $devDependencies);
+            return;
         }
 
         if (!confirm('Install dependencies now?', true)) {
@@ -239,10 +324,9 @@ class FlexiAddCommand extends Command
         }
     }
 
-    private function isRegistryComponentInstalled(string $component): bool
+    private function isRegistryComponentInstalled(RegistryComponentReference $reference, string $namespace): bool
     {
-        $nameSpace = str_starts_with($component, '@') ? explode('/', $component)[0] : 'flexiwind';
-        return $this->store->exists($component, $nameSpace);
+        return $this->store->exists($reference->component, $namespace);
     }
 
     private function extractPackageName(string $dependency): string
@@ -250,7 +334,7 @@ class FlexiAddCommand extends Command
         return explode('@', $dependency)[0];
     }
 
-    private function determineSource(string $component, ?string $namespace): array
+    private function determineSource(RegistryComponentReference $reference, ?string $namespace): array
     {
         if ($namespace) {
             if (!isset($this->registries[$namespace])) {
@@ -258,13 +342,15 @@ class FlexiAddCommand extends Command
             }
             return $this->parseRegistryConfig($this->registries[$namespace]);
         }
-        if (str_starts_with($component, '@')) {
-            $prefix = explode('/', $component, 2)[0];
-            if (!isset($this->registries[$prefix])) {
-                throw new \RuntimeException("Namespace {$prefix} not found in configuration.");
+
+        if ($reference->namespace !== null) {
+            if (!isset($this->registries[$reference->namespace])) {
+                throw new \RuntimeException("Namespace {$reference->namespace} not found in configuration.");
             }
-            return $this->parseRegistryConfig($this->registries[$prefix]);
+
+            return $this->parseRegistryConfig($this->registries[$reference->namespace]);
         }
+
         return ['baseUrl' => $this->defaultSource];
     }
 
@@ -295,27 +381,56 @@ class FlexiAddCommand extends Command
         return $expanded;
     }
 
-    private function fetchRegistry(string $component, array $source): ?array
+    /**
+     * @return array{registry: array, resolvedVersion: string|null, url: string}|null
+     */
+    private function fetchRegistry(RegistryComponentReference $reference, array $source): ?array
     {
-        $componentName = str_starts_with($component, '@') ? (explode('/', $component, 2)[1] ?? $component) : $component;
-        $url = str_replace('{name}', $componentName, $source['baseUrl']);
-        $json = HttpUtils::getJson($url, $source['headers'] ?? [], $source['params'] ?? []);
-        return is_array($json) ? $json : null;
+        return $this->versionResolver->resolve(
+            $source['baseUrl'],
+            $reference->componentName,
+            $reference->version,
+            $source['headers'] ?? [],
+            $source['params'] ?? []
+        );
     }
 
-    private function processFile(array $file): void
+    private function processFile(array $file, bool $rewrite): void
     {
         $targetPath = $this->projectRoot . '/' . $file['target'];
         $dir = dirname($targetPath);
+        $target = (string) $file['target'];
+        $exists = file_exists($targetPath);
+
+        if ($exists && !$rewrite) {
+            $this->skippedFiles[] = $target;
+            $this->warn("File exists, skipping: {$target}");
+            return;
+        }
+
+        if ($this->dryRun) {
+            if ($exists) {
+                $this->overwrittenFiles[] = $target;
+                $this->line("[dry] overwrite: {$target}");
+            } else {
+                $this->createdFiles[] = $target;
+                $this->line("[dry] create: {$target}");
+            }
+            return;
+        }
+
         if (!is_dir($dir)) {
             mkdir($dir, 0777, true);
         }
-        if (file_exists($targetPath)) {
-            $this->warn("File exists, skipping: {$file['target']}");
+
+        file_put_contents($targetPath, $file['content']);
+
+        if ($exists) {
+            $this->overwrittenFiles[] = $target;
             return;
         }
-        file_put_contents($targetPath, $file['content']);
-        $this->createdFiles[] = $file['target'];
+
+        $this->createdFiles[] = $target;
     }
 
     private function savePendingCommands(array $dependencies, array $devDependencies): void
@@ -388,5 +503,73 @@ class FlexiAddCommand extends Command
         foreach ($messages as $message) {
             $this->line("- {$message}");
         }
+    }
+
+    private function resolveRewriteDecision(
+        RegistryComponentReference $reference,
+        bool $isInstalled,
+        ?string $installedVersion,
+        ?string $resolvedVersion
+    ): bool {
+        if (!$isInstalled) {
+            return false;
+        }
+
+        if ($this->forceRewrite) {
+            return true;
+        }
+
+        if ($this->forceNoRewrite) {
+            return false;
+        }
+
+        $targetVersion = $reference->version ?? $resolvedVersion;
+        if ($targetVersion !== null && $installedVersion !== null && $targetVersion !== $installedVersion) {
+            if ($this->dryRun) {
+                $this->line("[dry] Would update {$reference->component} from {$installedVersion} to {$targetVersion}");
+                return true;
+            }
+
+            return confirm(
+                "Component {$reference->component} is installed at {$installedVersion}; requested {$targetVersion}. Overwrite current files and update?",
+                false
+            );
+        }
+
+        if ($this->dryRun) {
+            return true;
+        }
+
+        return confirm("Component {$reference->component} is already installed. Rewrite existing files?", false);
+    }
+
+    private function renderDryRunSummary(): void
+    {
+        $this->line('');
+        $this->line('====== Dry Run Summary ======');
+
+        if (!empty($this->resolvedRegistries)) {
+            $this->line('Registry resolution:');
+            foreach ($this->resolvedRegistries as $entry) {
+                $requested = $entry['requested'] ? (' requested=' . $entry['requested']) : ' requested=latest';
+                $resolved = $entry['resolved'] ? (' resolved=' . $entry['resolved']) : '';
+                $url = $entry['url'] ? (' url=' . $entry['url']) : '';
+                $this->line("  - {$entry['component']}{$requested}{$resolved}{$url}");
+            }
+        }
+
+        $this->line('Files:');
+        $this->line('  create: ' . count($this->createdFiles));
+        $this->line('  overwrite: ' . count($this->overwrittenFiles));
+        $this->line('  skip: ' . count($this->skippedFiles));
+
+        if (!empty($this->pendingCommands)) {
+            $this->line('Dependency commands (planned only):');
+            foreach ($this->pendingCommands as $command) {
+                $this->line('  ' . $command);
+            }
+        }
+
+        $this->line('================================');
     }
 }
