@@ -13,7 +13,9 @@ class FlexiBuildCommand extends Command
 {
     protected $signature = 'flexi:build
         {--output= : Output directory name (relative to current directory)}
-        {--schema=registry.json : The schema file to build from}';
+        {--schema=registry.json : The schema file to build from}
+        {--override : Force override components even if version is unchanged}
+        {--no-override : Never override components if version is unchanged}';
 
     protected $description = 'Build registries from schema file';
 
@@ -25,13 +27,21 @@ class FlexiBuildCommand extends Command
         $cleanOutputDir = trim($outputDir, '/\\');
         $fullOutputPath = getcwd() . DIRECTORY_SEPARATOR . $cleanOutputDir;
 
+        // Determine override mode
+        $overrideMode = 'auto';
+        if ($this->option('override')) {
+            $overrideMode = 'force';
+        } elseif ($this->option('no-override')) {
+            $overrideMode = 'never';
+        }
+
         try {
             if (!file_exists($schemaPath)) {
                 error("Schema file not found: {$schemaPath}");
                 return self::FAILURE;
             }
 
-            $builder->build($schemaPath, $fullOutputPath);
+            $builder->build($schemaPath, $fullOutputPath, $overrideMode);
             info("Registries built successfully in: {$cleanOutputDir}");
         } catch (\Exception $e) {
             error($e->getMessage());
