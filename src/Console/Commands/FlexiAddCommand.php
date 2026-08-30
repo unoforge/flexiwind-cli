@@ -7,7 +7,7 @@ use FlexiCore\Core\RegistryComponentReference;
 use FlexiCore\Core\RegistryStore;
 use FlexiCore\Core\RegistryVersionResolver;
 use FlexiCore\Installer\PackageInstaller;
-use FlexiCore\Service\ProjectDetector;
+use FlexiCore\Service\{ProjectDetector, CssVariableMergeService};
 use Illuminate\Console\Command;
 use Symfony\Component\Yaml\Yaml;
 
@@ -41,6 +41,7 @@ class FlexiAddCommand extends Command
     private bool $dryRun = false;
     private bool $forceRewrite = false;
     private bool $forceNoRewrite = false;
+    private array $cssModifications = [];
 
     public function __construct(
         private readonly RegistryStore $store = new RegistryStore(),
@@ -85,7 +86,7 @@ class FlexiAddCommand extends Command
             return self::SUCCESS;
         }
 
-        if (!empty($this->createdFiles) || !empty($this->overwrittenFiles)) {
+        if (!empty($this->createdFiles) || !empty($this->overwrittenFiles) || !empty($this->cssModifications)) {
             $this->info('====== Everything installed ======');
             foreach ($this->createdFiles as $fileCreated) {
                 $this->line("✓ Created : {$fileCreated}");
@@ -146,8 +147,11 @@ class FlexiAddCommand extends Command
             'url' => $resolved['url'] ?? '',
         ];
 
-        if (!isset($registryJson['files']) || !is_array($registryJson['files'])) {
-            $this->warn("Invalid registry: no files for {$reference->component}");
+        $hasFiles = isset($registryJson['files']) && is_array($registryJson['files']) && !empty($registryJson['files']);
+        $hasCss = !empty($registryJson['cssVars']) || !empty($registryJson['css']);
+
+        if (!$hasFiles && !$hasCss) {
+            $this->warn("Invalid registry: no files or CSS for {$reference->component}");
             return;
         }
 
@@ -174,16 +178,19 @@ class FlexiAddCommand extends Command
             $this->handlePackageDependencies($registryJson);
         }
 
-        if ($this->dryRun) {
-            foreach ($registryJson['files'] as $file) {
-                $this->processFile($file, $rewrite);
-            }
-        } else {
-            spin(message: 'Processing files...', callback: function () use ($registryJson, $rewrite): void {
-                foreach ($registryJson['files'] as $file) {
+        $files = $registryJson['files'] ?? [];
+        if (!empty($files)) {
+            if ($this->dryRun) {
+                foreach ($files as $file) {
                     $this->processFile($file, $rewrite);
                 }
-            });
+            } else {
+                spin(message: 'Processing files...', callback: function () use ($files, $rewrite): void {
+                    foreach ($files as $file) {
+                        $this->processFile($file, $rewrite);
+                    }
+                });
+            }
         }
 
         $this->installedRegistryComponents[] = $reference->component;
@@ -199,6 +206,9 @@ class FlexiAddCommand extends Command
                 is_string($resolvedVersion) ? $resolvedVersion : Constants::DEFAULT_COMPONENT_VERSION,
                 $registryJson['message'] ?? null
             );
+
+            $this->applyCssVariables($registryJson, $reference->component);
+
             $this->info("{$reference->component} added successfully");
             return;
         }
@@ -620,5 +630,40 @@ class FlexiAddCommand extends Command
         }
 
         $this->line('================================');
+    }
+
+    private function applyCssVariables(array $registryJson, string $componentName): void
+    {
+        if (empty($registryJson['cssVars']) && empty($registryJson['css'])) {
+            return;
+        }
+
+        try {
+            $config = Yaml::parseFile($this->projectRoot . '/flexiwind.yaml');
+            $cssPath = $config['cssPath'] ?? 'resources/css';
+
+            $service = new CssVariableMergeService($this->projectRoot, ['path' => $cssPath]);
+            $summary = $service->applyComponentStyles($registryJson, 'app');
+
+            if (isset($summary['error'])) {
+                $this->warn("CSS merge warning for {$componentName}: {$summary['error']}");
+                return;
+            }
+
+            if ($summary['success'] ?? false) {
+                $varsCount = $summary['varsCount'] ?? 0;
+                $rulesCount = $summary['rulesCount'] ?? 0;
+                if ($varsCount > 0 || $rulesCount > 0) {
+                    $this->line("  ✓ CSS variables updated: {$varsCount} vars, {$rulesCount} rules");
+                    $this->cssModifications[] = [
+                        'component' => $componentName,
+                        'varsCount' => $varsCount,
+                        'rulesCount' => $rulesCount,
+                    ];
+                }
+            }
+        } catch (\Exception $e) {
+            $this->warn("Could not apply CSS variables for {$componentName}: {$e->getMessage()}");
+        }
     }
 }

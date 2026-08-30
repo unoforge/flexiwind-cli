@@ -62,11 +62,6 @@ class FlexiInitCommand extends Command
             return self::FAILURE;
         }
 
-        if (!empty($projectAnswers['fromStarter'])) {
-            info('Starter projects are not yet implemented.');
-            return self::SUCCESS;
-        }
-
         $projectPath = $initProjectFromCli
             ? $projectAnswers['projectPath'] ?? getcwd() . '/' . ($projectAnswers['name'] ?? 'my-app')
             : getcwd();
