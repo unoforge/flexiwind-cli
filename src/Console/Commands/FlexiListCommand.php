@@ -38,7 +38,12 @@ class FlexiListCommand extends Command
         $registry = $this->argument('registry');
 
         if (!$registry) {
-            return $this->listAllRegistries();
+            if (!empty($this->registries)) {
+                return $this->listAllRegistries();
+            }
+
+            // No named registries: list the default source catalog directly.
+            $registry = 'default';
         }
 
         $source = $this->resolveRegistrySource($registry);
@@ -49,8 +54,9 @@ class FlexiListCommand extends Command
         }
 
         $filters = [];
-        if ($this->option('type')) {
-            $filters['type'] = $this->option('type');
+        $type = $this->option('type');
+        if (is_string($type) && $type !== '') {
+            $filters['type'] = $this->normalizeTypeFilter($type);
         }
         if ($this->option('search')) {
             $filters['search'] = $this->option('search');
@@ -68,12 +74,13 @@ class FlexiListCommand extends Command
             $registry,
             $filters,
             $source['headers'] ?? [],
-            $source['params'] ?? []
+            $source['params'] ?? [],
+            $source['baseUrl'] ?? null
         );
 
         if (!$result['success']) {
             $this->warn($result['message']);
-            return self::SUCCESS;
+            return self::FAILURE;
         }
 
         $this->displayRegistry($registry, $result, $options);
@@ -81,15 +88,23 @@ class FlexiListCommand extends Command
         return self::SUCCESS;
     }
 
+    private function normalizeTypeFilter(string $type): string
+    {
+        $value = trim($type);
+
+        return match (strtolower($value)) {
+            'style', 'styles', 'theme', 'themes' => 'registry:style',
+            'ui' => 'registry:ui',
+            'block', 'blocks' => 'registry:block',
+            'component', 'components' => 'registry:component',
+            default => str_starts_with($value, 'registry:') ? $value : 'registry:' . $value,
+        };
+    }
+
     private function listAllRegistries(): int
     {
         $this->line('<fg=blue>📦 Available Registries</>');
         $this->line('');
-
-        if (empty($this->registries)) {
-            $this->warn('No registries configured. Run "flexi:init" first.');
-            return self::SUCCESS;
-        }
 
         foreach ($this->registries as $name => $config) {
             $url = is_string($config) ? $config : ($config['url'] ?? '');
@@ -97,7 +112,7 @@ class FlexiListCommand extends Command
         }
 
         $this->line('');
-        $this->line('Use: <fg=cyan>php artisan flexi:list {registry-name}</> to see components');
+        $this->line('Use: <fg=cyan>php artisan flexi:list {registry-name} --type=style</> to see themes');
 
         return self::SUCCESS;
     }

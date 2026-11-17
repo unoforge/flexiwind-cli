@@ -7,7 +7,7 @@ use FlexiCore\Core\RegistryComponentReference;
 use FlexiCore\Core\RegistryStore;
 use FlexiCore\Core\RegistryVersionResolver;
 use FlexiCore\Installer\PackageInstaller;
-use FlexiCore\Service\{ProjectDetector, CssVariableMergeService};
+use FlexiCore\Service\{ComponentInputExpander, ProjectDetector, CssVariableMergeService};
 use Illuminate\Console\Command;
 use Symfony\Component\Yaml\Yaml;
 
@@ -17,8 +17,11 @@ use function Laravel\Prompts\spin;
 class FlexiAddCommand extends Command
 {
     protected $signature = 'flexi:add
-        {components* : Component refs to add (button, button@0.0.2, @fly-ui/button@0.0.1)}
+        {components?* : Component refs to add (button, mono, theme-mono, theme-*, @flexiwind/*)}
         {--namespace= : Namespace to use for all components}
+        {--all : Install every registry listed in the source index}
+        {--themes : Install every Playground theme (registry:style)}
+        {--type= : Filter --all / globs by type (style, registry:style, ui, block, …)}
         {--skip-deps : Skip dependency installation}
         {--rewrite : Rewrite existing files for already installed components}
         {--no-rewrite : Do not rewrite existing files for already installed components}
@@ -45,7 +48,8 @@ class FlexiAddCommand extends Command
 
     public function __construct(
         private readonly RegistryStore $store = new RegistryStore(),
-        private readonly RegistryVersionResolver $versionResolver = new RegistryVersionResolver()
+        private readonly RegistryVersionResolver $versionResolver = new RegistryVersionResolver(),
+        private readonly ComponentInputExpander $inputExpander = new ComponentInputExpander()
     ) {
         parent::__construct();
         $this->projectRoot = getcwd();
@@ -54,8 +58,11 @@ class FlexiAddCommand extends Command
 
     public function handle(): int
     {
-        $components = (array) $this->argument('components');
+        $components = array_map('strval', (array) $this->argument('components'));
         $namespace = $this->option('namespace');
+        $installAll = (bool) $this->option('all');
+        $installThemes = (bool) $this->option('themes');
+        $typeFilter = $this->option('type');
         $skipDeps = (bool) $this->option('skip-deps');
         $this->dryRun = (bool) $this->option('dry');
         $this->forceRewrite = (bool) $this->option('rewrite');
@@ -66,12 +73,38 @@ class FlexiAddCommand extends Command
             return self::FAILURE;
         }
 
+        if ($installAll && $installThemes) {
+            $this->error('Cannot use --all and --themes together.');
+            return self::FAILURE;
+        }
+
         if (!$this->configExists()) {
             $this->error('Flexiwind not initialized. Run flexi:init first.');
             return self::FAILURE;
         }
 
         $this->store->init();
+
+        try {
+            $components = $this->inputExpander->expand(
+                $components,
+                is_string($namespace) ? $namespace : null,
+                $installAll,
+                $installThemes,
+                is_string($typeFilter) ? $typeFilter : null,
+                $this->defaultSource,
+                $this->registries,
+                fn(string $message) => $this->info($message)
+            );
+        } catch (\RuntimeException $e) {
+            $this->error($e->getMessage());
+            return self::FAILURE;
+        }
+
+        if (empty($components)) {
+            $this->error('No components specified. Pass component names, theme-*, --themes, @namespace/*, or --all.');
+            return self::FAILURE;
+        }
 
         foreach ($components as $component) {
             $this->addComponent($component, is_string($namespace) ? $namespace : null, $skipDeps);

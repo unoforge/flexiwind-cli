@@ -1,7 +1,7 @@
 {
     "name": "unoforge/flexiwind-cli",
     "description": "Flexiwind Artisan commands",
-    "version": "1.0.6",
+    "version": "1.0.7",
     "type": "library",
     "require": {
         "php": "^8.2",
